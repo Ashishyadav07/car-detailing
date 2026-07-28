@@ -6,6 +6,7 @@ import HeroSection from './components/HeroSection'
 import ConfiguratorUI from './components/ConfiguratorUI'
 import DragHint from './components/DragHint'
 import BuildSummaryModal from './components/BuildSummaryModal'
+import ArtOfDetailing from './components/ArtOfDetailing'
 import ServicesSection from './components/ServicesSection'
 import AboutSection from './components/AboutSection'
 import ContactSection from './components/ContactSection'
@@ -121,8 +122,12 @@ function App() {
       </section>
 
 
-      {/* 2. BESPOKE SERVICES SECTION */}
+      {/* 2. SECTION 2: THE ART OF DETAILING */}
+      <ArtOfDetailing />
+
+      {/* 3. BESPOKE SERVICES SECTION */}
       <ServicesSection />
+
 
       {/* 3. ABOUT & STUDIO CAPABILITIES SECTION */}
       <AboutSection />
