@@ -177,34 +177,53 @@ export const INTERIOR_OPTIONS = [
   },
 ]
 
-// Central Feature Focus Presets with Exact Target Turntable Y-Rotations
-export const CAMERA_PRESETS = [
-  {
+// Central Source of Truth for Feature Target Y-Rotations
+export const FEATURE_FOCUS_CONFIG = {
+  hero34: 0.65,  // 37° 3/4 front view
+  side: 1.57,    // 90° Side profile silhouette
+  wheels: 2.22,  // 127° Optimal angle revealing rim spokes, Brembo caliper, and disc
+  front: 0.0,    // 0° Dead-center front grille view
+}
+
+// Central Feature Focus Presets with Shared Target Turntable Y-Rotations & Calibrated Canonical Poses (Immutable Reference)
+export const CAMERA_PRESETS = Object.freeze([
+  Object.freeze({
     id: 'hero-34',
     label: '3/4 Studio',
-    position: [4.8, 1.8, 4.8],
-    target: [0, 0.7, 0],
-    targetYRotation: 0.65, // 37° 3/4 front view
-  },
-  {
+    position: Object.freeze([4.9, 1.8, 4.9]),
+    target: Object.freeze([0.0, 0.65, 0.0]),
+    targetYRotation: FEATURE_FOCUS_CONFIG.hero34,
+    scrollP: 0.00,
+  }),
+  Object.freeze({
     id: 'side',
     label: 'Side Profile',
-    position: [0, 1.5, 5.8],
-    target: [0, 0.6, 0],
-    targetYRotation: 1.57, // 90° Side profile silhouette
-  },
-  {
+    position: Object.freeze([0.0, 1.45, 5.7]),
+    target: Object.freeze([0.0, 0.60, 0.0]),
+    targetYRotation: FEATURE_FOCUS_CONFIG.side,
+    scrollP: 0.22,
+  }),
+  Object.freeze({
     id: 'wheels',
     label: 'Rims & Brakes',
-    position: [3.2, 1.2, 3.8],
-    target: [0, 0.5, 0],
-    targetYRotation: 2.25, // 129° Close-up angle showing rim & Brembo caliper
-  },
-  {
+    position: Object.freeze([2.4, 0.82, 2.4]),
+    target: Object.freeze([0.72, 0.38, 0.95]),
+    targetYRotation: FEATURE_FOCUS_CONFIG.wheels,
+    scrollP: 0.48,
+  }),
+  Object.freeze({
     id: 'front',
     label: 'Front Grille',
-    position: [0, 1.5, 5.0],
-    target: [0, 0.6, 0],
-    targetYRotation: 0.0, // 0° Dead-center front grille view
-  },
-]
+    position: Object.freeze([0.0, 1.25, 3.6]),
+    target: Object.freeze([0.0, 0.62, 0.4]),
+    targetYRotation: FEATURE_FOCUS_CONFIG.front,
+    scrollP: 0.70,
+  }),
+])
+
+
+
+
+
+
+

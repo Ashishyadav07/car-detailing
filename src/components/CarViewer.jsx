@@ -1,89 +1,199 @@
-import React, { useRef, useEffect } from 'react'
+import React, { useRef, useEffect, useState } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import { OrbitControls, Environment, Html } from '@react-three/drei'
 import * as THREE from 'three'
 import CarModel from './CarModel'
 import CameraController from './CameraController'
 import StudioEnvironment from './StudioEnvironment'
-import { CAMERA_PRESETS } from '../constants/configuratorOptions'
+import { CAMERA_PRESETS, FEATURE_FOCUS_CONFIG } from '../constants/configuratorOptions'
+
+// Helper function to calculate scroll-driven car rotation Y angle AND deterministic cinematic camera pose
+function getScrollDrivenTransform(p) {
+  const preset34 = CAMERA_PRESETS.find((preset) => preset.id === 'hero-34') || CAMERA_PRESETS[0]
+  const presetSide = CAMERA_PRESETS.find((preset) => preset.id === 'side') || CAMERA_PRESETS[1]
+  const presetWheels = CAMERA_PRESETS.find((preset) => preset.id === 'wheels') || CAMERA_PRESETS[2]
+  const presetFront = CAMERA_PRESETS.find((preset) => preset.id === 'front') || CAMERA_PRESETS[3]
+
+  const CAMERA_STATES = {
+    hero34:   { rotY: preset34.targetYRotation, pos: preset34.position, target: preset34.target, name: '3/4 STUDIO' },
+    side:     { rotY: presetSide.targetYRotation, pos: presetSide.position, target: presetSide.target, name: 'SIDE PROFILE' },
+    wheels:   { rotY: presetWheels.targetYRotation, pos: presetWheels.position, target: presetWheels.target, name: 'RIMS & BRAKES' },
+    pullback: { rotY: 1.10, pos: [1.8, 1.4, 4.5], target: [0.15, 0.58, 0.1], name: 'TRANSITION' },
+    front:    { rotY: presetFront.targetYRotation, pos: presetFront.position, target: presetFront.target, name: 'FRONT GRILLE' },
+  }
+
+  // Immediate continuous keyframes sequence (No dead zone: 0.00 -> 0.22 -> 0.48 -> 0.58 -> 0.70 -> 0.88 -> 1.00)
+  const keyframes = [
+    { p: 0.00, ...CAMERA_STATES.hero34 },
+    { p: 0.22, ...CAMERA_STATES.side },
+    { p: 0.48, ...CAMERA_STATES.wheels },
+    { p: 0.58, ...CAMERA_STATES.pullback },
+    { p: 0.70, ...CAMERA_STATES.front },
+    { p: 0.88, ...CAMERA_STATES.hero34 },
+    { p: 1.00, ...CAMERA_STATES.hero34 },
+  ]
+
+
+  const clampedP = Math.max(0, Math.min(1, p))
+
+  let i = 0
+  while (i < keyframes.length - 1 && keyframes[i + 1].p < clampedP) {
+    i++
+  }
+
+  if (i >= keyframes.length - 1) {
+    const last = keyframes[keyframes.length - 1]
+    return { rotY: last.rotY, pos: [...last.pos], target: [...last.target], stageName: last.name }
+  }
+
+  const k1 = keyframes[i]
+  const k2 = keyframes[i + 1]
+
+  const range = k2.p - k1.p
+  const t = range > 0 ? (clampedP - k1.p) / range : 0
+
+  // Hermite smoothstep for natural movement
+  const smoothT = t * t * (3 - 2 * t)
+
+  // Shortest angular path calculation for turntable rotation Y
+  let diff = (k2.rotY - k1.rotY) % (Math.PI * 2)
+  if (diff > Math.PI) diff -= Math.PI * 2
+  if (diff < -Math.PI) diff += Math.PI * 2
+
+  const rotY = k1.rotY + diff * smoothT
+
+  // Camera position smooth interpolation
+  const pos = [
+    k1.pos[0] + (k2.pos[0] - k1.pos[0]) * smoothT,
+    k1.pos[1] + (k2.pos[1] - k1.pos[1]) * smoothT,
+    k1.pos[2] + (k2.pos[2] - k1.pos[2]) * smoothT,
+  ]
+
+  // Camera lookAt target smooth interpolation
+  const target = [
+    k1.target[0] + (k2.target[0] - k1.target[0]) * smoothT,
+    k1.target[1] + (k2.target[1] - k1.target[1]) * smoothT,
+    k1.target[2] + (k2.target[2] - k1.target[2]) * smoothT,
+  ]
+
+  return { rotY, pos, target, stageName: k1.name }
+}
 
 // Single Central Rotation Controller Component
-function CentralRotationController({ config, rotationYRef, velocityRef, stateRef, targetYRef, holdTimerRef }) {
+function CentralRotationController({
+  config,
+  rotationYRef,
+  velocityRef,
+  stateRef,
+  targetYRef,
+  holdTimerRef,
+  scrollYProgress,
+  controlsRef,
+  onDebugUpdate,
+}) {
   const pivotGroupRef = useRef()
+  const lastScrollPRef = useRef(0)
+  const dampedScrollPRef = useRef(0)
+  const targetCamPosRef = useRef(new THREE.Vector3())
+  const targetCamLookRef = useRef(new THREE.Vector3())
 
-  useFrame((_, delta) => {
+
+  useFrame((state, delta) => {
     if (!pivotGroupRef.current) return
 
-    // Cap delta to avoid frame jumps on tab switch
     const safeDelta = Math.min(delta, 0.1)
 
-    // 1. DRAGGING MODE: Directly apply drag velocity
-    if (stateRef.current === 'DRAGGING') {
+    // Sample raw scroll progress (0 to 1)
+    const rawP = scrollYProgress ? scrollYProgress.get() : 0
+    const scrollDelta = Math.abs(rawP - lastScrollPRef.current)
+
+    // Detect user scrolling: if user scrolls and is not manually dragging, enter SCROLLING state
+    if (scrollDelta > 0.0001 && stateRef.current !== 'DRAGGING') {
+      stateRef.current = 'SCROLLING'
+    }
+    lastScrollPRef.current = rawP
+
+    // Smooth continuous damping on scroll progress value for physics-like acceleration & deceleration
+    const dampingSpeed = stateRef.current === 'SCROLLING' ? 8.0 : 5.0
+    dampedScrollPRef.current += (rawP - dampedScrollPRef.current) * Math.min(safeDelta * dampingSpeed, 1.0)
+    
+    if (Math.abs(rawP - dampedScrollPRef.current) < 0.0001) {
+      dampedScrollPRef.current = rawP
+    }
+
+    const { rotY, pos, target, stageName } = getScrollDrivenTransform(dampedScrollPRef.current)
+
+    // Update debug info
+    if (onDebugUpdate) {
+      onDebugUpdate(dampedScrollPRef.current, stateRef.current, stageName)
+    }
+
+
+    // 1. SCROLLING MODE: Damped scroll progress drives car turntable rotation & camera close-ups
+    if (stateRef.current === 'SCROLLING') {
+      // Smoothly lerp turntable rotation Y towards scroll target angle
+      let diff = (rotY - rotationYRef.current) % (2 * Math.PI)
+      if (diff > Math.PI) diff -= 2 * Math.PI
+      if (diff < -Math.PI) diff += 2 * Math.PI
+
+      if (Math.abs(diff) < 0.0005) {
+        rotationYRef.current = rotY
+      } else {
+        rotationYRef.current += diff * Math.min(safeDelta * 10, 1.0)
+      }
+
+      // Smoothly lerp camera position & OrbitControls lookAt target with deterministic convergence
+      if (controlsRef.current && state.camera) {
+        targetCamPosRef.current.set(...pos)
+        targetCamLookRef.current.set(...target)
+
+        if (state.camera.position.distanceTo(targetCamPosRef.current) < 0.002) {
+          state.camera.position.copy(targetCamPosRef.current)
+        } else {
+          state.camera.position.lerp(targetCamPosRef.current, Math.min(safeDelta * 10, 1.0))
+        }
+
+        if (controlsRef.current.target.distanceTo(targetCamLookRef.current) < 0.002) {
+          controlsRef.current.target.copy(targetCamLookRef.current)
+        } else {
+          controlsRef.current.target.lerp(targetCamLookRef.current, Math.min(safeDelta * 10, 1.0))
+        }
+
+        controlsRef.current.update()
+      }
+    }
+
+    // 2. DRAGGING MODE: Directly apply manual drag velocity
+    else if (stateRef.current === 'DRAGGING') {
       rotationYRef.current += velocityRef.current
     }
-    
-    // 2. MOMENTUM MODE: Decelerate velocity with exponential friction
+
+    // 3. MOMENTUM MODE: Decelerate velocity with exponential friction
     else if (stateRef.current === 'MOMENTUM') {
       rotationYRef.current += velocityRef.current
       const friction = 5.5
       velocityRef.current *= Math.exp(-friction * safeDelta)
 
-      // When momentum settles near zero, transition to FOCUSED/IDLE
+      // When momentum settles near zero, return to SCROLLING state
       if (Math.abs(velocityRef.current) < 0.0002) {
         velocityRef.current = 0
-        stateRef.current = 'IDLE'
+        stateRef.current = 'SCROLLING'
       }
     }
 
-    // 3. FOCUSING MODE: Smoothly animate car turntable rotation to target feature angle
-    else if (stateRef.current === 'FOCUSING') {
-      const currentAngle = rotationYRef.current
-      const targetAngle = targetYRef.current
-
-      // Calculate shortest angular path (-Math.PI to +Math.PI)
-      let diff = (targetAngle - currentAngle) % (2 * Math.PI)
-      if (diff > Math.PI) diff -= 2 * Math.PI
-      if (diff < -Math.PI) diff += 2 * Math.PI
-
-      // Smooth lerp transition towards target angle
-      if (Math.abs(diff) > 0.003) {
-        rotationYRef.current += diff * Math.min(safeDelta * 6, 1.0)
-      } else {
-        // Target reached: lock position and set state to FOCUSED
-        rotationYRef.current = targetAngle
-        stateRef.current = 'FOCUSED'
-
-        // Hold car completely stationary for feature inspection, then smoothly resume IDLE
-        if (holdTimerRef.current) clearTimeout(holdTimerRef.current)
-        holdTimerRef.current = setTimeout(() => {
-          if (stateRef.current === 'FOCUSED') {
-            stateRef.current = 'IDLE'
-          }
-        }, 3000)
-      }
-    }
-
-    // 4. FOCUSED MODE: Hold car 100% stationary for feature inspection
-    else if (stateRef.current === 'FOCUSED') {
-      // Car remains completely stationary
-    }
-
-    // 5. IDLE MODE: Slow continuous turntable spin (0.12 rad/s)
-    else if (stateRef.current === 'IDLE') {
-      rotationYRef.current += safeDelta * 0.12
-    }
-
-    // Apply Y-axis turntable rotation to the CAR PIVOT ONLY
+    // Apply Y-axis turntable rotation to the CAR PIVOT ONLY (Studio remains 100% stationary)
     pivotGroupRef.current.rotation.y = rotationYRef.current
   })
 
   return (
-    // PRESERVED MODEL TRANSFORM AT ORIGIN (rotation=[0,0,0])
     <group ref={pivotGroupRef} position={[0, 0, 0]}>
       <CarModel url="/models/ford_mustang_shelby_gt500.glb" config={config} />
     </group>
   )
 }
+
+
+
 
 function Loader() {
   return (
@@ -96,31 +206,21 @@ function Loader() {
   )
 }
 
-export default function CarViewer({ config, cameraPresetId, onUserInteract }) {
+export default function CarViewer({ config, cameraPresetId, onUserInteract, scrollYProgress }) {
   const controlsRef = useRef()
-  const rotationYRef = useRef(0)
+  const rotationYRef = useRef(FEATURE_FOCUS_CONFIG.hero34)
   const velocityRef = useRef(0)
   const previousPointerXRef = useRef(0)
   const targetYRef = useRef(0)
   const holdTimerRef = useRef(null)
 
-  // Single Rotation Controller State Machine: 'IDLE' | 'DRAGGING' | 'MOMENTUM' | 'FOCUSING' | 'FOCUSED'
-  const stateRef = useRef('IDLE')
+  // Debug state tracking for dev verification
+  const [debugInfo, setDebugInfo] = useState({ progress: 0, state: 'SCROLLING', stage: '3/4' })
 
-  // Listen for Feature Focus Preset Button Clicks (Side, Rims, Brakes, Front, 3/4)
-  useEffect(() => {
-    const preset = CAMERA_PRESETS.find((p) => p.id === cameraPresetId)
-    if (preset && preset.targetYRotation !== undefined) {
-      // Immediately cancel idle, momentum, and drag velocity
-      velocityRef.current = 0
-      targetYRef.current = preset.targetYRotation
-      stateRef.current = 'FOCUSING'
+  // Central Rotation Controller State Machine: 'SCROLLING' | 'DRAGGING' | 'MOMENTUM' | 'FOCUSING' | 'FOCUSED'
+  const stateRef = useRef('SCROLLING')
 
-      if (holdTimerRef.current) clearTimeout(holdTimerRef.current)
-    }
-  }, [cameraPresetId])
-
-  // Drag Interaction Handlers (User Interruption overrides Feature Focus immediately)
+  // Drag Interaction Handlers (User Interruption overrides Feature Focus & Scroll immediately)
   const handlePointerDown = (e) => {
     stateRef.current = 'DRAGGING'
     previousPointerXRef.current = e.clientX || (e.touches && e.touches[0].clientX) || 0
@@ -136,7 +236,6 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract }) {
     const deltaX = currentX - previousPointerXRef.current
     previousPointerXRef.current = currentX
 
-    // Convert drag displacement into instant rotational velocity
     const sensitivity = 0.005
     const instVelocity = deltaX * sensitivity
     velocityRef.current = velocityRef.current * 0.35 + instVelocity * 0.65
@@ -147,6 +246,13 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract }) {
     stateRef.current = 'MOMENTUM'
   }
 
+  const handleDebugUpdate = (progress, stateName, stageName) => {
+    // Throttled debug UI update
+    if (Math.abs(progress - debugInfo.progress) > 0.02 || stateName !== debugInfo.state) {
+      setDebugInfo({ progress, state: stateName, stage: stageName })
+    }
+  }
+
   useEffect(() => {
     return () => {
       if (holdTimerRef.current) clearTimeout(holdTimerRef.current)
@@ -155,7 +261,7 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract }) {
 
   return (
     <div
-      className="absolute inset-0 w-full h-full bg-[#08090c] overflow-hidden select-none cursor-grab active:cursor-grabbing"
+      className="w-full h-full bg-[#08090c] overflow-hidden select-none cursor-grab active:cursor-grabbing relative"
       onMouseDown={handlePointerDown}
       onMouseMove={handlePointerMove}
       onMouseUp={handlePointerUp}
@@ -188,23 +294,35 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract }) {
             stateRef={stateRef}
             targetYRef={targetYRef}
             holdTimerRef={holdTimerRef}
+            scrollYProgress={scrollYProgress}
+            controlsRef={controlsRef}
+            onDebugUpdate={handleDebugUpdate}
           />
         </React.Suspense>
 
-        {/* 5. ORBIT CONTROLS FOR ZOOM & TILT */}
+
+
+        {/* 5. ORBIT CONTROLS FOR MOUSE/TOUCH PANNING (Wheel Zoom Disabled to Allow Natural Page Scroll) */}
         <OrbitControls
           ref={controlsRef}
-          enableRotate={false} // Horizontal drag directly drives single central rotation controller
+          enableRotate={false} // Horizontal drag directly drives central rotation controller
           enablePan={false}
-          enableZoom={true}
-          minDistance={2.5} // Prevents clipping into car body
-          maxDistance={11.0} // Generous zoom out inside spacious studio bay
+          enableZoom={false} // CRITICAL FIX: Disable wheel zoom so mouse wheel triggers page scrolling!
           minPolarAngle={Math.PI / 4} // 45 deg elevation
           maxPolarAngle={Math.PI / 2 - 0.02} // Prevents camera going below floor
           target={[0, 0.7, 0]}
           makeDefault
         />
       </Canvas>
+
+      {/* Temporary Debug Indicator UI (Requirement 14) */}
+      <div className="absolute bottom-4 left-4 z-40 bg-slate-950/80 border border-slate-800 backdrop-blur-md px-3 py-1.5 rounded-lg text-[10px] font-mono text-slate-300 pointer-events-none flex items-center gap-3">
+        <span>Scroll: <strong className="text-blue-400">{debugInfo.progress.toFixed(2)}</strong></span>
+        <span>State: <strong className="text-indigo-400">{debugInfo.state}</strong></span>
+        <span>Stage: <strong className="text-cyan-400">{debugInfo.stage}</strong></span>
+      </div>
     </div>
   )
 }
+
+

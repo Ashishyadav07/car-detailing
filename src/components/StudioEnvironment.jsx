@@ -26,21 +26,30 @@ export default function StudioEnvironment() {
         // 1. Physical Emissive LED Ceiling Light Panels
         if (matName === 'lights' || meshName.includes('light')) {
           child.material.emissive = new THREE.Color('#ffffff')
-          child.material.emissiveIntensity = 4.5
+          child.material.emissiveIntensity = 4.2
           child.material.toneMapped = false
         }
 
-        // 2. Slate Tile Ground Floor Material Enhancement
-        else if (matName.includes('tiles') || meshName.includes('ground')) {
-          child.material.roughness = 0.28
-          child.material.metalness = 0.55
-          child.material.envMapIntensity = 1.4
+        // 2. Dark Satin Automotive Detailing Studio Floor (Non-mirror, satin concrete / epoxy finish)
+        else if (
+          matName.includes('tiles') ||
+          matName.includes('ground') ||
+          matName.includes('floor') ||
+          meshName.includes('tiles') ||
+          meshName.includes('ground') ||
+          meshName.includes('floor')
+        ) {
+          child.material.color = new THREE.Color('#14161b')
+          child.material.roughness = 0.68 // Premium satin finish (no mirror gloss)
+          child.material.metalness = 0.05  // Non-metallic dark epoxy feel
+          child.material.envMapIntensity = 0.35 // Subtle supporting highlights, no strong car mirror reflection
         }
 
-        // 3. Studio Wall Material Enhancement
+        // 3. Studio Wall & Structure Enhancement
         else if (matName === 'material' || meshName.includes('wall')) {
-          child.material.roughness = 0.85
-          child.material.metalness = 0.2
+          child.material.roughness = 0.88
+          child.material.metalness = 0.1
+          child.material.envMapIntensity = 0.3
         }
       }
     })
@@ -65,19 +74,9 @@ export default function StudioEnvironment() {
       {/* 2. THE ENLARGED 3D DETAILING STUDIO MODEL (STATIONARY, 2.2x SCALE) */}
       <primitive object={clonedStudio} />
 
-      {/* 3. SOFT REALISTIC GROUND CONTACT SHADOW ON STUDIO FLOOR */}
-      <ContactShadows
-        position={[0, 0.003, 0]}
-        opacity={0.92}
-        scale={16}
-        blur={1.6}
-        far={4.0}
-        resolution={1024}
-        color="#000000"
-      />
-
-      {/* 4. CINEMATIC DIRECT LIGHTING MATCHING ENLARGED STUDIO */}
+      {/* 3. CINEMATIC DIRECT LIGHTING MATCHING ENLARGED STUDIO */}
       <ambientLight intensity={0.7} />
+
 
       {/* Overhead Key Light */}
       <directionalLight
@@ -103,3 +102,4 @@ export default function StudioEnvironment() {
 }
 
 useGLTF.preload('/models/studio_v1_for_car.glb')
+
