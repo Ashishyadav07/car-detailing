@@ -10,6 +10,41 @@ import {
   INTERIOR_OPTIONS,
 } from '../constants/configuratorOptions'
 
+// Rate (1/s) of the material cross-fade. Expressed as a rate rather than a
+// per-frame factor so the 300ms transition lasts 300ms at any frame rate.
+const MATERIAL_LAMBDA = 8
+// Below this combined error the transition is snapped exact and switched off.
+// A lerp is asymptotic, so without this the loop keeps rewriting every
+// material of the car on every frame forever.
+const MATERIAL_EPS = 1e-3
+
+function stepMaterialGroup(mats, targetColor, option, factor) {
+  let maxError = 0
+  for (let i = 0; i < mats.length; i++) {
+    const mat = mats[i]
+    const error =
+      Math.abs(mat.color.r - targetColor.r) +
+      Math.abs(mat.color.g - targetColor.g) +
+      Math.abs(mat.color.b - targetColor.b) +
+      Math.abs(mat.roughness - option.roughness) +
+      Math.abs(mat.metalness - option.metalness)
+
+    if (error > maxError) maxError = error
+
+    if (error < MATERIAL_EPS) {
+      mat.color.copy(targetColor)
+      mat.roughness = option.roughness
+      mat.metalness = option.metalness
+      continue
+    }
+
+    mat.color.lerp(targetColor, factor)
+    mat.roughness += (option.roughness - mat.roughness) * factor
+    mat.metalness += (option.metalness - mat.metalness) * factor
+  }
+  return maxError
+}
+
 export default function CarModel({ url, config }) {
   const { scene } = useGLTF(url)
   const clonedScene = useMemo(() => scene.clone(true), [scene])
@@ -54,6 +89,9 @@ export default function CarModel({ url, config }) {
     [config.interior]
   )
 
+  // True only while a material cross-fade is actually in flight.
+  const isTransitioningRef = useRef(true)
+
   // Update target colors when config changes
   useEffect(() => {
     targetPaintColor.current.set(activePaint.color)
@@ -61,6 +99,7 @@ export default function CarModel({ url, config }) {
     targetTireColor.current.set(activeTire.color)
     targetBrakeColor.current.set(activeBrake.color)
     targetInteriorColor.current.set(activeInterior.color)
+    isTransitioningRef.current = true
   }, [activePaint, activeRim, activeTire, activeBrake, activeInterior])
 
   // Setup Initial Positioning (PRESERVED: rotation=[0,0,0]) & Categorize Materials
@@ -156,46 +195,36 @@ export default function CarModel({ url, config }) {
         child.material.envMapIntensity = 2.8
       }
     })
+
+    // Freshly collected materials still carry their GLTF values.
+    isTransitioningRef.current = true
   }, [clonedScene])
 
-  // Smooth Material Lerping in Frame Loop (300ms smooth transition)
+  // Smooth Material Lerping in Frame Loop (300ms smooth transition).
+  // Idles out completely once the cross-fade has converged, so a static car
+  // costs nothing per frame.
   useFrame((_, delta) => {
-    const lerpFactor = Math.min(delta * 8, 1.0)
+    if (!isTransitioningRef.current) return
 
-    // Lerp Paint
-    materialsRef.current.paint.forEach((mat) => {
-      mat.color.lerp(targetPaintColor.current, lerpFactor)
-      mat.roughness = THREE.MathUtils.lerp(mat.roughness, activePaint.roughness, lerpFactor)
-      mat.metalness = THREE.MathUtils.lerp(mat.metalness, activePaint.metalness, lerpFactor)
-    })
+    const groups = materialsRef.current
+    const total =
+      groups.paint.length +
+      groups.rim.length +
+      groups.tire.length +
+      groups.brake.length +
+      groups.interior.length
+    if (total === 0) return
 
-    // Lerp Rims
-    materialsRef.current.rim.forEach((mat) => {
-      mat.color.lerp(targetRimColor.current, lerpFactor)
-      mat.roughness = THREE.MathUtils.lerp(mat.roughness, activeRim.roughness, lerpFactor)
-      mat.metalness = THREE.MathUtils.lerp(mat.metalness, activeRim.metalness, lerpFactor)
-    })
+    const factor = 1 - Math.exp(-MATERIAL_LAMBDA * Math.min(delta, 0.1))
 
-    // Lerp Tires
-    materialsRef.current.tire.forEach((mat) => {
-      mat.color.lerp(targetTireColor.current, lerpFactor)
-      mat.roughness = THREE.MathUtils.lerp(mat.roughness, activeTire.roughness, lerpFactor)
-      mat.metalness = THREE.MathUtils.lerp(mat.metalness, activeTire.metalness, lerpFactor)
-    })
+    let maxError = 0
+    maxError = Math.max(maxError, stepMaterialGroup(groups.paint, targetPaintColor.current, activePaint, factor))
+    maxError = Math.max(maxError, stepMaterialGroup(groups.rim, targetRimColor.current, activeRim, factor))
+    maxError = Math.max(maxError, stepMaterialGroup(groups.tire, targetTireColor.current, activeTire, factor))
+    maxError = Math.max(maxError, stepMaterialGroup(groups.brake, targetBrakeColor.current, activeBrake, factor))
+    maxError = Math.max(maxError, stepMaterialGroup(groups.interior, targetInteriorColor.current, activeInterior, factor))
 
-    // Lerp Brakes
-    materialsRef.current.brake.forEach((mat) => {
-      mat.color.lerp(targetBrakeColor.current, lerpFactor)
-      mat.roughness = THREE.MathUtils.lerp(mat.roughness, activeBrake.roughness, lerpFactor)
-      mat.metalness = THREE.MathUtils.lerp(mat.metalness, activeBrake.metalness, lerpFactor)
-    })
-
-    // Lerp Interior
-    materialsRef.current.interior.forEach((mat) => {
-      mat.color.lerp(targetInteriorColor.current, lerpFactor)
-      mat.roughness = THREE.MathUtils.lerp(mat.roughness, activeInterior.roughness, lerpFactor)
-      mat.metalness = THREE.MathUtils.lerp(mat.metalness, activeInterior.metalness, lerpFactor)
-    })
+    if (maxError < MATERIAL_EPS) isTransitioningRef.current = false
   })
 
   return (

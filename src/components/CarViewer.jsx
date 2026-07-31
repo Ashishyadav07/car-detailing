@@ -1,189 +1,166 @@
-import React, { useRef, useEffect, useState } from 'react'
+import React, { useRef, useEffect, useState, useCallback } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import { OrbitControls, Html } from '@react-three/drei'
 import * as THREE from 'three'
 import CarModel from './CarModel'
 import CameraController from './CameraController'
 import StudioEnvironment from './StudioEnvironment'
-import { CAMERA_PRESETS, FEATURE_FOCUS_CONFIG } from '../constants/configuratorOptions'
+import { FEATURE_FOCUS_CONFIG } from '../constants/configuratorOptions'
+import { CriticallyDampedSpring, clamp, clamp01, damp, smootherstep } from '../utils/animation'
+import { createPose, evalPose } from '../utils/heroCameraPath'
 
-// Helper function to calculate scroll-driven car rotation Y angle AND deterministic cinematic camera pose
-function getScrollDrivenTransform(p) {
-  const preset34 = CAMERA_PRESETS.find((preset) => preset.id === 'hero-34') || CAMERA_PRESETS[0]
-  const presetSide = CAMERA_PRESETS.find((preset) => preset.id === 'side') || CAMERA_PRESETS[1]
-  const presetWheels = CAMERA_PRESETS.find((preset) => preset.id === 'wheels') || CAMERA_PRESETS[2]
-  const presetFront = CAMERA_PRESETS.find((preset) => preset.id === 'front') || CAMERA_PRESETS[3]
+/* -------------------------------------------------------------------------
+ * MOTION TUNING
+ * The whole "feel" of the hero lives in these numbers.
+ * ---------------------------------------------------------------------- */
 
-  const CAMERA_STATES = {
-    hero34:   { rotY: preset34.targetYRotation, pos: preset34.position, target: preset34.target, name: '3/4 STUDIO' },
-    side:     { rotY: presetSide.targetYRotation, pos: presetSide.position, target: presetSide.target, name: 'SIDE PROFILE' },
-    wheels:   { rotY: presetWheels.targetYRotation, pos: presetWheels.position, target: presetWheels.target, name: 'RIMS & BRAKES' },
-    pullback: { rotY: 1.10, pos: [1.8, 1.4, 4.5], target: [0.15, 0.58, 0.1], name: 'TRANSITION' },
-    front:    { rotY: presetFront.targetYRotation, pos: presetFront.position, target: presetFront.target, name: 'FRONT GRILLE' },
-  }
+// Scroll follower. omega is the spring's natural frequency in rad/s; ~12 gives
+// a roughly 0.35s settle — tight enough to feel locked to the page, soft
+// enough that a flick of the wheel reads as a camera move, not a jump cut.
+const SCROLL_OMEGA = 12
+// A critically damped follower trails a constant-velocity target by exactly
+// 2/omega seconds. Feeding that much look-ahead back in cancels the trailing
+// without giving up any of the smoothing, so the camera stays synchronised
+// with the scrollbar instead of chasing it.
+const SCROLL_LEAD = 0.55
+const SCROLL_LEAD_CLAMP = 0.09
+const SCROLL_VEL_LAMBDA = 14
 
-  // Immediate continuous keyframes sequence (No dead zone: 0.00 -> 0.22 -> 0.48 -> 0.58 -> 0.70 -> 0.88 -> 1.00)
-  const keyframes = [
-    { p: 0.00, ...CAMERA_STATES.hero34 },
-    { p: 0.22, ...CAMERA_STATES.side },
-    { p: 0.48, ...CAMERA_STATES.wheels },
-    { p: 0.58, ...CAMERA_STATES.pullback },
-    { p: 0.70, ...CAMERA_STATES.front },
-    { p: 0.88, ...CAMERA_STATES.hero34 },
-    { p: 1.00, ...CAMERA_STATES.hero34 },
-  ]
+// Turntable drag.
+const DRAG_SENSITIVITY = 0.005 // rad per pixel (unchanged)
+const DRAG_OMEGA = 20 // weight behind the finger without visible lag
+const DRAG_FRICTION = 3.2 // coast decay after release, 1/s
+const RETURN_LAMBDA = 2.6 // pull back onto the scroll-driven angle
+const RETURN_ENGAGE_VEL = 0.9 // rad/s below which the return blends in
+const SETTLE_EPS = 1e-4
 
+// Long frames (tab wake-up, GC, a heavy React commit) would otherwise be
+// integrated as one huge step and show up as a lurch.
+const MAX_DELTA = 1 / 20
 
-  const clampedP = Math.max(0, Math.min(1, p))
+const HERO_START_POSE = evalPose(0, createPose())
+const START_CAMERA_POSITION = HERO_START_POSE.pos.toArray()
+const START_CAMERA_TARGET = HERO_START_POSE.target.toArray()
 
-  let i = 0
-  while (i < keyframes.length - 1 && keyframes[i + 1].p < clampedP) {
-    i++
-  }
+/* -------------------------------------------------------------------------
+ * CENTRAL ROTATION CONTROLLER
+ * ---------------------------------------------------------------------- */
 
-  if (i >= keyframes.length - 1) {
-    const last = keyframes[keyframes.length - 1]
-    return { rotY: last.rotY, pos: [...last.pos], target: [...last.target], stageName: last.name }
-  }
-
-  const k1 = keyframes[i]
-  const k2 = keyframes[i + 1]
-
-  const range = k2.p - k1.p
-  const t = range > 0 ? (clampedP - k1.p) / range : 0
-
-  // Hermite smoothstep for natural movement
-  const smoothT = t * t * (3 - 2 * t)
-
-  // Shortest angular path calculation for turntable rotation Y
-  let diff = (k2.rotY - k1.rotY) % (Math.PI * 2)
-  if (diff > Math.PI) diff -= Math.PI * 2
-  if (diff < -Math.PI) diff += Math.PI * 2
-
-  const rotY = k1.rotY + diff * smoothT
-
-  // Camera position smooth interpolation
-  const pos = [
-    k1.pos[0] + (k2.pos[0] - k1.pos[0]) * smoothT,
-    k1.pos[1] + (k2.pos[1] - k1.pos[1]) * smoothT,
-    k1.pos[2] + (k2.pos[2] - k1.pos[2]) * smoothT,
-  ]
-
-  // Camera lookAt target smooth interpolation
-  const target = [
-    k1.target[0] + (k2.target[0] - k1.target[0]) * smoothT,
-    k1.target[1] + (k2.target[1] - k1.target[1]) * smoothT,
-    k1.target[2] + (k2.target[2] - k1.target[2]) * smoothT,
-  ]
-
-  return { rotY, pos, target, stageName: k1.name }
-}
-
-// Single Central Rotation Controller Component
 function CentralRotationController({
   config,
   rotationYRef,
-  velocityRef,
-  stateRef,
-  targetYRef,
-  holdTimerRef,
+  isDraggingRef,
+  dragTargetRef,
+  dragSpringRef,
   scrollYProgress,
   controlsRef,
-  onDebugUpdate,
+  debugRefs,
 }) {
   const pivotGroupRef = useRef()
-  const lastScrollPRef = useRef(0)
-  const dampedScrollPRef = useRef(0)
-  const targetCamPosRef = useRef(new THREE.Vector3())
-  const targetCamLookRef = useRef(new THREE.Vector3())
 
+  // Every mutable piece of frame state is preallocated once.
+  const scrollSpringRef = useRef(null)
+  if (scrollSpringRef.current === null) {
+    scrollSpringRef.current = new CriticallyDampedSpring(
+      scrollYProgress ? scrollYProgress.get() : 0
+    )
+  }
+  const lastRawPRef = useRef(scrollYProgress ? scrollYProgress.get() : 0)
+  const scrollVelRef = useRef(0)
+  const debugAccumRef = useRef(0)
+  const poseRef = useRef(null)
+  if (poseRef.current === null) poseRef.current = createPose()
 
+  // Priority -2 so this runs *before* drei's OrbitControls update (which is
+  // registered at -1). The controls then apply our pose once per frame instead
+  // of the scene being updated twice.
   useFrame((state, delta) => {
-    if (!pivotGroupRef.current) return
+    const pivot = pivotGroupRef.current
+    if (!pivot) return
 
-    const safeDelta = Math.min(delta, 0.1)
+    const dt = delta > MAX_DELTA ? MAX_DELTA : delta
+    if (dt <= 0) return
 
-    // Sample raw scroll progress (0 to 1)
+    /* --- 1. Scroll progress -> one smoothing stage, zero net lag --------- */
+
     const rawP = scrollYProgress ? scrollYProgress.get() : 0
-    const scrollDelta = Math.abs(rawP - lastScrollPRef.current)
 
-    // Detect user scrolling: if user scrolls and is not manually dragging, enter SCROLLING state
-    if (scrollDelta > 0.0001 && stateRef.current !== 'DRAGGING') {
-      stateRef.current = 'SCROLLING'
-    }
-    lastScrollPRef.current = rawP
+    const instVel = (rawP - lastRawPRef.current) / dt
+    lastRawPRef.current = rawP
+    scrollVelRef.current = damp(scrollVelRef.current, instVel, SCROLL_VEL_LAMBDA, dt)
 
-    // Smooth continuous damping on scroll progress value for physics-like acceleration & deceleration
-    const dampingSpeed = stateRef.current === 'SCROLLING' ? 8.0 : 5.0
-    dampedScrollPRef.current += (rawP - dampedScrollPRef.current) * Math.min(safeDelta * dampingSpeed, 1.0)
-    
-    if (Math.abs(rawP - dampedScrollPRef.current) < 0.0001) {
-      dampedScrollPRef.current = rawP
-    }
+    const lead = clamp(
+      scrollVelRef.current * ((SCROLL_LEAD * 2) / SCROLL_OMEGA),
+      -SCROLL_LEAD_CLAMP,
+      SCROLL_LEAD_CLAMP
+    )
+    const p = scrollSpringRef.current.step(rawP + lead, SCROLL_OMEGA, dt)
 
-    const { rotY, pos, target, stageName } = getScrollDrivenTransform(dampedScrollPRef.current)
+    /* --- 2. Pose is read straight from the smoothed progress ------------- */
+    // No second filter: the source is already C1-smooth, so there is nothing
+    // left to damp and therefore no trailing error to snap away later.
 
-    // Update debug info
-    if (onDebugUpdate) {
-      onDebugUpdate(dampedScrollPRef.current, stateRef.current, stageName)
-    }
+    const pose = evalPose(p, poseRef.current)
 
+    /* --- 3. Turntable = scroll angle + drag offset ----------------------- */
 
-    // 1. SCROLLING MODE: Damped scroll progress drives car turntable rotation & camera close-ups
-    if (stateRef.current === 'SCROLLING') {
-      // Smoothly lerp turntable rotation Y towards scroll target angle
-      let diff = (rotY - rotationYRef.current) % (2 * Math.PI)
-      if (diff > Math.PI) diff -= 2 * Math.PI
-      if (diff < -Math.PI) diff += 2 * Math.PI
+    const drag = dragSpringRef.current
+    if (isDraggingRef.current) {
+      // The offset springs toward the raw pointer target: the car has weight
+      // behind the finger and single-pixel pointer jitter is filtered out.
+      drag.step(dragTargetRef.current, DRAG_OMEGA, dt)
+    } else {
+      // Release keeps the spring's own velocity, so there is no discontinuity
+      // at the moment the pointer lifts. Momentum coasts under friction and
+      // the pull back onto the scroll angle fades in as that momentum dies,
+      // which removes the hard state switch the old machine had.
+      drag.velocity *= Math.exp(-DRAG_FRICTION * dt)
+      drag.value += drag.velocity * dt
 
-      if (Math.abs(diff) < 0.0005) {
-        rotationYRef.current = rotY
-      } else {
-        rotationYRef.current += diff * Math.min(safeDelta * 10, 1.0)
+      const engage = smootherstep(
+        1 - clamp01(Math.abs(drag.velocity) / RETURN_ENGAGE_VEL)
+      )
+      if (engage > 0) {
+        drag.value = damp(drag.value, 0, RETURN_LAMBDA * engage, dt)
       }
 
-      // Smoothly lerp camera position & OrbitControls lookAt target with deterministic convergence
-      if (controlsRef.current && state.camera) {
-        targetCamPosRef.current.set(...pos)
-        targetCamLookRef.current.set(...target)
-
-        if (state.camera.position.distanceTo(targetCamPosRef.current) < 0.002) {
-          state.camera.position.copy(targetCamPosRef.current)
-        } else {
-          state.camera.position.lerp(targetCamPosRef.current, Math.min(safeDelta * 10, 1.0))
-        }
-
-        if (controlsRef.current.target.distanceTo(targetCamLookRef.current) < 0.002) {
-          controlsRef.current.target.copy(targetCamLookRef.current)
-        } else {
-          controlsRef.current.target.lerp(targetCamLookRef.current, Math.min(safeDelta * 10, 1.0))
-        }
-
-        controlsRef.current.update()
+      if (Math.abs(drag.velocity) < SETTLE_EPS && Math.abs(drag.value) < SETTLE_EPS) {
+        drag.velocity = 0
+        drag.value = 0
       }
+      dragTargetRef.current = drag.value
     }
 
-    // 2. DRAGGING MODE: Directly apply manual drag velocity
-    else if (stateRef.current === 'DRAGGING') {
-      rotationYRef.current += velocityRef.current
+    rotationYRef.current = pose.rotY + drag.value
+    pivot.rotation.y = rotationYRef.current
+
+    /* --- 4. Camera ------------------------------------------------------- */
+
+    state.camera.position.copy(pose.pos)
+    const controls = controlsRef.current
+    if (controls) {
+      controls.target.copy(pose.target)
+    } else {
+      state.camera.lookAt(pose.target)
     }
 
-    // 3. MOMENTUM MODE: Decelerate velocity with exponential friction
-    else if (stateRef.current === 'MOMENTUM') {
-      rotationYRef.current += velocityRef.current
-      const friction = 5.5
-      velocityRef.current *= Math.exp(-friction * safeDelta)
+    /* --- 5. Debug HUD, written straight to the DOM at 10Hz --------------- */
+    // Deliberately not React state: re-rendering this component every frame
+    // used to hand the main thread a commit that competed with the render.
 
-      // When momentum settles near zero, return to SCROLLING state
-      if (Math.abs(velocityRef.current) < 0.0002) {
-        velocityRef.current = 0
-        stateRef.current = 'SCROLLING'
-      }
+    debugAccumRef.current += dt
+    if (debugAccumRef.current >= 0.1) {
+      debugAccumRef.current = 0
+      const stateName = isDraggingRef.current
+        ? 'DRAGGING'
+        : drag.velocity !== 0 || drag.value !== 0
+          ? 'MOMENTUM'
+          : 'SCROLLING'
+      writeDebug(debugRefs.progress.current, clamp01(p).toFixed(2))
+      writeDebug(debugRefs.state.current, stateName)
+      writeDebug(debugRefs.stage.current, pose.stage)
     }
-
-    // Apply Y-axis turntable rotation to the CAR PIVOT ONLY (Studio remains 100% stationary)
-    pivotGroupRef.current.rotation.y = rotationYRef.current
-  })
+  }, -2)
 
   return (
     <group ref={pivotGroupRef} position={[0, 0, 0]}>
@@ -192,8 +169,9 @@ function CentralRotationController({
   )
 }
 
-
-
+function writeDebug(el, text) {
+  if (el && el.textContent !== text) el.textContent = text
+}
 
 function Loader() {
   return (
@@ -209,70 +187,99 @@ function Loader() {
 export default function CarViewer({ config, cameraPresetId, onUserInteract, scrollYProgress }) {
   const controlsRef = useRef()
   const rotationYRef = useRef(FEATURE_FOCUS_CONFIG.hero34)
-  const velocityRef = useRef(0)
-  const previousPointerXRef = useRef(0)
-  const targetYRef = useRef(0)
-  const holdTimerRef = useRef(null)
 
-  // Debug state tracking for dev verification
-  const [debugInfo, setDebugInfo] = useState({ progress: 0, state: 'SCROLLING', stage: '3/4' })
+  // Drag state. Shared by reference with the frame loop so pointer events
+  // never trigger a React render.
+  const isDraggingRef = useRef(false)
+  const dragTargetRef = useRef(0)
+  const dragSpringRef = useRef(null)
+  if (dragSpringRef.current === null) dragSpringRef.current = new CriticallyDampedSpring(0)
+  const lastPointerXRef = useRef(0)
+  const activePointerRef = useRef(null)
 
-  // Central Rotation Controller State Machine: 'SCROLLING' | 'DRAGGING' | 'MOMENTUM' | 'FOCUSING' | 'FOCUSED'
-  const stateRef = useRef('SCROLLING')
+  const debugRefs = useRef({
+    progress: React.createRef(),
+    state: React.createRef(),
+    stage: React.createRef(),
+  }).current
 
-  // Drag Interaction Handlers (User Interruption overrides Feature Focus & Scroll immediately)
-  const handlePointerDown = (e) => {
-    stateRef.current = 'DRAGGING'
-    previousPointerXRef.current = e.clientX || (e.touches && e.touches[0].clientX) || 0
-    velocityRef.current = 0
-
-    if (onUserInteract) onUserInteract()
-    if (holdTimerRef.current) clearTimeout(holdTimerRef.current)
-  }
-
-  const handlePointerMove = (e) => {
-    if (stateRef.current !== 'DRAGGING') return
-    const currentX = e.clientX || (e.touches && e.touches[0].clientX) || 0
-    const deltaX = currentX - previousPointerXRef.current
-    previousPointerXRef.current = currentX
-
-    const sensitivity = 0.005
-    const instVelocity = deltaX * sensitivity
-    velocityRef.current = velocityRef.current * 0.35 + instVelocity * 0.65
-  }
-
-  const handlePointerUp = () => {
-    if (stateRef.current !== 'DRAGGING') return
-    stateRef.current = 'MOMENTUM'
-  }
-
-  const handleDebugUpdate = (progress, stateName, stageName) => {
-    // Throttled debug UI update
-    if (Math.abs(progress - debugInfo.progress) > 0.02 || stateName !== debugInfo.state) {
-      setDebugInfo({ progress, state: stateName, stage: stageName })
-    }
-  }
+  // Pause the render loop once the hero is well clear of the viewport. The
+  // sticky canvas otherwise keeps drawing a full PBR scene with a 2048px
+  // shadow map behind every section below it.
+  const rootRef = useRef(null)
+  const [inView, setInView] = useState(true)
 
   useEffect(() => {
-    return () => {
-      if (holdTimerRef.current) clearTimeout(holdTimerRef.current)
-    }
+    const el = rootRef.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const observer = new IntersectionObserver(
+      ([entry]) => setInView(entry.isIntersecting),
+      { rootMargin: '25% 0px 25% 0px' }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  const handlePointerDown = useCallback(
+    (e) => {
+      if (e.button !== undefined && e.button !== 0) return
+      isDraggingRef.current = true
+      activePointerRef.current = e.pointerId
+      lastPointerXRef.current = e.clientX
+      // Catch the car exactly where it is; the spring bleeds off any leftover
+      // momentum instead of the rotation jumping.
+      dragTargetRef.current = dragSpringRef.current.value
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId)
+      } catch {
+        /* capture is best-effort */
+      }
+      if (onUserInteract) onUserInteract()
+    },
+    [onUserInteract]
+  )
+
+  const handlePointerMove = useCallback((e) => {
+    if (!isDraggingRef.current) return
+    if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return
+    const x = e.clientX
+    dragTargetRef.current += (x - lastPointerXRef.current) * DRAG_SENSITIVITY
+    lastPointerXRef.current = x
+  }, [])
+
+  // Pointer capture guarantees this fires even when the release happens
+  // outside the canvas, which previously left the controller stuck in
+  // DRAGGING and froze the scroll animation.
+  const handlePointerUp = useCallback((e) => {
+    if (!isDraggingRef.current) return
+    if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return
+    isDraggingRef.current = false
+    activePointerRef.current = null
   }, [])
 
   return (
     <div
+      ref={rootRef}
       className="w-full h-full bg-[#08090c] overflow-hidden select-none cursor-grab active:cursor-grabbing relative"
-      onMouseDown={handlePointerDown}
-      onMouseMove={handlePointerMove}
-      onMouseUp={handlePointerUp}
-      onTouchStart={handlePointerDown}
-      onTouchMove={handlePointerMove}
-      onTouchEnd={handlePointerUp}
+      // pan-y keeps vertical page scrolling native on touch while horizontal
+      // gestures reach us as pointer events without being cancelled.
+      style={{ touchAction: 'pan-y' }}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onLostPointerCapture={handlePointerUp}
     >
       <Canvas
         shadows
-        camera={{ position: [4.8, 1.8, 4.8], fov: 38 }}
-        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.1 }}
+        frameloop={inView ? 'always' : 'never'}
+        camera={{ position: START_CAMERA_POSITION, fov: 38 }}
+        gl={{
+          antialias: true,
+          toneMapping: THREE.ACESFilmicToneMapping,
+          toneMappingExposure: 1.1,
+          powerPreference: 'high-performance',
+        }}
       >
         <color attach="background" args={['#08090c']} />
 
@@ -287,17 +294,14 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
           <CentralRotationController
             config={config}
             rotationYRef={rotationYRef}
-            velocityRef={velocityRef}
-            stateRef={stateRef}
-            targetYRef={targetYRef}
-            holdTimerRef={holdTimerRef}
+            isDraggingRef={isDraggingRef}
+            dragTargetRef={dragTargetRef}
+            dragSpringRef={dragSpringRef}
             scrollYProgress={scrollYProgress}
             controlsRef={controlsRef}
-            onDebugUpdate={handleDebugUpdate}
+            debugRefs={debugRefs}
           />
         </React.Suspense>
-
-
 
         {/* 5. ORBIT CONTROLS FOR MOUSE/TOUCH PANNING (Wheel Zoom Disabled to Allow Natural Page Scroll) */}
         <OrbitControls
@@ -305,21 +309,20 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
           enableRotate={false} // Horizontal drag directly drives central rotation controller
           enablePan={false}
           enableZoom={false} // CRITICAL FIX: Disable wheel zoom so mouse wheel triggers page scrolling!
+          enableDamping={false} // All damping is handled by the controller above
           minPolarAngle={Math.PI / 4} // 45 deg elevation
           maxPolarAngle={Math.PI / 2 - 0.02} // Prevents camera going below floor
-          target={[0, 0.7, 0]}
+          target={START_CAMERA_TARGET}
           makeDefault
         />
       </Canvas>
 
       {/* Temporary Debug Indicator UI (Requirement 14) */}
       <div className="absolute bottom-4 left-4 z-40 bg-slate-950/80 border border-slate-800 backdrop-blur-md px-3 py-1.5 rounded-lg text-[10px] font-mono text-slate-300 pointer-events-none flex items-center gap-3">
-        <span>Scroll: <strong className="text-blue-400">{debugInfo.progress.toFixed(2)}</strong></span>
-        <span>State: <strong className="text-indigo-400">{debugInfo.state}</strong></span>
-        <span>Stage: <strong className="text-cyan-400">{debugInfo.stage}</strong></span>
+        <span>Scroll: <strong className="text-blue-400" ref={debugRefs.progress}>0.00</strong></span>
+        <span>State: <strong className="text-indigo-400" ref={debugRefs.state}>SCROLLING</strong></span>
+        <span>Stage: <strong className="text-cyan-400" ref={debugRefs.stage}>3/4 STUDIO</strong></span>
       </div>
     </div>
   )
 }
-
-

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react'
-import { motion, useMotionValueEvent } from 'framer-motion'
+import React, { useState } from 'react'
+import { motion, useMotionValueEvent, useSpring, useTransform } from 'framer-motion'
 import { ChevronDown, Sparkles } from 'lucide-react'
 
 const STAGES = [
@@ -9,20 +9,34 @@ const STAGES = [
   { num: '04', title: 'FRONT GRILLE', range: [0.6, 0.8] },
 ]
 
+// Matches the critically damped follower driving the 3D camera (omega = 12,
+// so stiffness = omega^2 and damping = 2*omega) — the bar and the camera then
+// ease on the same curve instead of drifting apart.
+const BAR_SPRING = { stiffness: 144, damping: 24, mass: 1, restDelta: 0.0005 }
+
 export default function HeroSection({ scrollYProgress }) {
-  const [progress, setProgress] = useState(0)
+  // The bar is driven straight off a motion value: no React state, no layout,
+  // just a compositor transform. It used to animate `height` from a state
+  // update on every scroll event, which forced a layout pass per frame on the
+  // same main thread the 3D render loop runs on.
+  const smoothProgress = useSpring(scrollYProgress, BAR_SPRING)
+  const barScaleY = useTransform(smoothProgress, (p) => Math.min(1, Math.max(0.05, p)))
+
+  // Only the two genuinely discrete pieces of UI stay in React state, and they
+  // re-render on a change of value rather than on every scroll tick.
+  const [activeIndex, setActiveIndex] = useState(0)
+  const [showScrollHint, setShowScrollHint] = useState(true)
 
   useMotionValueEvent(scrollYProgress, 'change', (latest) => {
-    setProgress(latest)
+    const nextIndex = Math.min(
+      Math.max(Math.floor(latest / 0.25), 0),
+      STAGES.length - 1
+    )
+    setActiveIndex((prev) => (prev !== nextIndex ? nextIndex : prev))
+
+    const nextHint = latest < 0.15
+    setShowScrollHint((prev) => (prev !== nextHint ? nextHint : prev))
   })
-
-  // Determine current active stage index (0 to 3)
-  const activeIndex = Math.min(
-    Math.floor(progress / 0.25),
-    STAGES.length - 1
-  )
-
-  const showScrollHint = progress < 0.15
 
   return (
     <div className="absolute inset-0 pointer-events-none z-30 flex flex-col justify-between p-6 md:p-10">
@@ -66,9 +80,9 @@ export default function HeroSection({ scrollYProgress }) {
         >
           {/* Vertical Track Progress Bar */}
           <div className="w-1 h-32 bg-slate-800/80 rounded-full overflow-hidden relative mb-1">
-            <div
-              className="w-full bg-gradient-to-b from-blue-500 via-indigo-500 to-cyan-400 rounded-full transition-all duration-150 ease-out"
-              style={{ height: `${Math.min(100, Math.max(5, progress * 100))}%` }}
+            <motion.div
+              className="w-full h-full origin-top bg-gradient-to-b from-blue-500 via-indigo-500 to-cyan-400 rounded-full"
+              style={{ scaleY: barScaleY }}
             />
           </div>
 
