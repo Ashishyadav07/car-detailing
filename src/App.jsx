@@ -7,7 +7,7 @@ import ConfiguratorUI from './components/ConfiguratorUI'
 import DragHint from './components/DragHint'
 import BuildSummaryModal from './components/BuildSummaryModal'
 import CinematicJourney from './components/CinematicJourney'
-import ServicesSection from './components/ServicesSection'
+import TransformationLab from './components/TransformationLab'
 import AboutSection from './components/AboutSection'
 import ContactSection from './components/ContactSection'
 import Footer from './components/Footer'
@@ -125,8 +125,8 @@ function App() {
       {/* 2. CINEMATIC ENVIRONMENT JOURNEY (400vh sticky, continues the hero) */}
       <CinematicJourney config={config} />
 
-      {/* 3. BESPOKE SERVICES SECTION */}
-      <ServicesSection />
+      {/* 3. INTERACTIVE TRANSFORMATION LAB (450vh sticky) */}
+      <TransformationLab config={config} />
 
 
       {/* 3. ABOUT & STUDIO CAPABILITIES SECTION */}

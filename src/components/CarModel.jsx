@@ -45,7 +45,15 @@ function stepMaterialGroup(mats, targetColor, option, factor) {
   return maxError
 }
 
-export default function CarModel({ url, config }) {
+// Dull baseline the Transformation Lab blends up from. Untouched by every
+// other caller since `finishRef` defaults to null there.
+const DULL_ROUGHNESS = 0.75
+const DULL_CLEARCOAT = 0.0
+const DULL_CLEARCOAT_ROUGHNESS = 0.6
+const DULL_ENV_INTENSITY = 0.5
+const GLOSSY_ENV_INTENSITY = 1.9
+
+export default function CarModel({ url, config, finishRef = null }) {
   const { scene } = useGLTF(url)
   const clonedScene = useMemo(() => scene.clone(true), [scene])
   const groupRef = useRef()
@@ -204,7 +212,10 @@ export default function CarModel({ url, config }) {
   // Idles out completely once the cross-fade has converged, so a static car
   // costs nothing per frame.
   useFrame((_, delta) => {
-    if (!isTransitioningRef.current) return
+    // finishRef keeps this frame loop alive even after the config transition
+    // has converged, since it drives roughness/clearcoat every frame from an
+    // external scroll value.
+    if (!isTransitioningRef.current && !finishRef) return
 
     const groups = materialsRef.current
     const total =
@@ -215,16 +226,37 @@ export default function CarModel({ url, config }) {
       groups.interior.length
     if (total === 0) return
 
-    const factor = 1 - Math.exp(-MATERIAL_LAMBDA * Math.min(delta, 0.1))
+    if (isTransitioningRef.current) {
+      const factor = 1 - Math.exp(-MATERIAL_LAMBDA * Math.min(delta, 0.1))
 
-    let maxError = 0
-    maxError = Math.max(maxError, stepMaterialGroup(groups.paint, targetPaintColor.current, activePaint, factor))
-    maxError = Math.max(maxError, stepMaterialGroup(groups.rim, targetRimColor.current, activeRim, factor))
-    maxError = Math.max(maxError, stepMaterialGroup(groups.tire, targetTireColor.current, activeTire, factor))
-    maxError = Math.max(maxError, stepMaterialGroup(groups.brake, targetBrakeColor.current, activeBrake, factor))
-    maxError = Math.max(maxError, stepMaterialGroup(groups.interior, targetInteriorColor.current, activeInterior, factor))
+      let maxError = 0
+      maxError = Math.max(maxError, stepMaterialGroup(groups.paint, targetPaintColor.current, activePaint, factor))
+      maxError = Math.max(maxError, stepMaterialGroup(groups.rim, targetRimColor.current, activeRim, factor))
+      maxError = Math.max(maxError, stepMaterialGroup(groups.tire, targetTireColor.current, activeTire, factor))
+      maxError = Math.max(maxError, stepMaterialGroup(groups.brake, targetBrakeColor.current, activeBrake, factor))
+      maxError = Math.max(maxError, stepMaterialGroup(groups.interior, targetInteriorColor.current, activeInterior, factor))
 
-    if (maxError < MATERIAL_EPS) isTransitioningRef.current = false
+      if (maxError < MATERIAL_EPS) isTransitioningRef.current = false
+    }
+
+    // Transformation Lab gloss sweep: overrides roughness/clearcoat/env
+    // intensity on the paint group only, blending from a dull baseline up to
+    // the option's own natural glossy values. Computed fresh each frame from
+    // `finishRef.current`, so it never fights the color lerp above.
+    if (finishRef) {
+      const f = Math.min(1, Math.max(0, finishRef.current))
+      const paintMats = groups.paint
+      for (let i = 0; i < paintMats.length; i++) {
+        const mat = paintMats[i]
+        mat.roughness = DULL_ROUGHNESS + (activePaint.roughness - DULL_ROUGHNESS) * f
+        mat.envMapIntensity = DULL_ENV_INTENSITY + (GLOSSY_ENV_INTENSITY - DULL_ENV_INTENSITY) * f
+        if ('clearcoat' in mat) {
+          mat.clearcoat = DULL_CLEARCOAT + (activePaint.clearcoat - DULL_CLEARCOAT) * f
+          mat.clearcoatRoughness =
+            DULL_CLEARCOAT_ROUGHNESS + (activePaint.clearcoatRoughness - DULL_CLEARCOAT_ROUGHNESS) * f
+        }
+      }
+    }
   })
 
   return (
