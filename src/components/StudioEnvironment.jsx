@@ -57,46 +57,51 @@ export default function StudioEnvironment() {
 
   return (
     <group position={[0, 0, 0]}>
-      {/* 1. REAL-TIME CEILING LED REFLECTION MAP (SCALED MATCHING ENLARGED STUDIO) */}
-      <Environment resolution={1024}>
+      {/* 1. STUDIO SOFTBOX REFLECTION MAP — single consolidated environment
+          (key/fill/rim softboxes baked once since nothing here animates) */}
+      <Environment resolution={1024} frames={1}>
         <group position={[0, 10, 0]}>
-          {/* Overhead Parallel LED Grid Reflection Bars */}
-          <Lightformer form="rect" intensity={7.0} color="#ffffff" position={[-6, 0, 0]} scale={[2.5, 16, 1]} rotation={[Math.PI / 2, 0, 0]} />
-          <Lightformer form="rect" intensity={8.0} color="#ffffff" position={[0, 0, 0]} scale={[3.0, 16, 1]} rotation={[Math.PI / 2, 0, 0]} />
-          <Lightformer form="rect" intensity={7.0} color="#ffffff" position={[6, 0, 0]} scale={[2.5, 16, 1]} rotation={[Math.PI / 2, 0, 0]} />
-          
-          {/* Side Soft Fill Reflections for Doors & Fenders */}
-          <Lightformer form="rect" intensity={3.5} color="#e0f2fe" position={[-12, -2, 0]} scale={[3, 18, 1]} rotation={[0, Math.PI / 2, 0]} />
-          <Lightformer form="rect" intensity={3.5} color="#e0f2fe" position={[12, -2, 0]} scale={[3, 18, 1]} rotation={[0, -Math.PI / 2, 0]} />
+          {/* Overhead key softbox — large + warm-neutral for a soft gradient across the roof/hood */}
+          <Lightformer form="rect" intensity={4.5} color="#fff4e6" position={[0, 0, 0]} scale={[6, 20, 1]} rotation={[Math.PI / 2, 0, 0]} />
+
+          {/* Side fill softboxes — cool, for door/fender reflections */}
+          <Lightformer form="rect" intensity={2.0} color="#dbeafe" position={[-13, -2, 0]} scale={[4, 18, 1]} rotation={[0, Math.PI / 2, 0]} />
+          <Lightformer form="rect" intensity={2.0} color="#dbeafe" position={[13, -2, 0]} scale={[4, 18, 1]} rotation={[0, -Math.PI / 2, 0]} />
         </group>
+
+        {/* Rim/back kicker strips — positioned behind the car to trace a bright edge along the silhouette */}
+        <Lightformer form="rect" intensity={6} color="#eaf4ff" position={[-4, 2, -10]} scale={[2, 6, 1]} rotation={[0, Math.PI / 6, 0]} />
+        <Lightformer form="rect" intensity={6} color="#eaf4ff" position={[4, 2, -10]} scale={[2, 6, 1]} rotation={[0, -Math.PI / 6, 0]} />
+
+        {/* Low front bounce — subtle warm ring mimicking floor bounce back into the lower body/bumper */}
+        <Lightformer form="ring" intensity={1.2} color="#fff7ed" position={[0, 0.5, 8]} scale={4} />
       </Environment>
 
       {/* 2. THE ENLARGED 3D DETAILING STUDIO MODEL (STATIONARY, 2.2x SCALE) */}
       <primitive object={clonedStudio} />
 
-      {/* 3. CINEMATIC DIRECT LIGHTING MATCHING ENLARGED STUDIO */}
-      <ambientLight intensity={0.7} />
+      {/* 3. CINEMATIC 3-POINT DIRECT LIGHTING (key / fill / rim) */}
 
+      {/* Ambient gradient fill — cool sky, warm dark ground, mimics studio floor bounce */}
+      <hemisphereLight args={['#dbe9ff', '#1a1712', 0.45]} />
 
-      {/* Overhead Key Light */}
+      {/* Key light — warm, angled upper-front, sole shadow caster */}
       <directionalLight
-        position={[0, 18, 0]}
-        intensity={3.0}
+        position={[6, 12, 7]}
+        intensity={1.8}
+        color="#fff2e0"
         castShadow
         shadow-mapSize={[2048, 2048]}
-        shadow-bias={-0.0001}
+        shadow-bias={-0.0002}
+        shadow-normalBias={0.02}
       />
 
-      {/* Parallel Row Directional Light Bars */}
-      <directionalLight position={[-8, 15, 6]} intensity={2.4} color="#f8fafc" />
-      <directionalLight position={[8, 15, 6]} intensity={2.4} color="#f8fafc" />
-      <directionalLight position={[-8, 15, -6]} intensity={2.0} color="#e0f2fe" />
-      <directionalLight position={[8, 15, -6]} intensity={2.0} color="#e0f2fe" />
+      {/* Fill light — cool, opposite side, low intensity, softens key-side shadow without flattening it */}
+      <directionalLight position={[-7, 6, 4]} intensity={0.5} color="#cfe3ff" />
 
-      {/* Low Side Fill for Rims & Tires */}
-      <directionalLight position={[-15, 5, 10]} intensity={1.2} />
-      <directionalLight position={[15, 5, 10]} intensity={1.2} />
-      <directionalLight position={[0, 5, -15]} intensity={1.4} />
+      {/* Rim / back lights — trace the trailing edges of the body to separate it from the dark background */}
+      <directionalLight position={[-5, 7, -9]} intensity={1.6} color="#eaf4ff" />
+      <directionalLight position={[5, 7, -9]} intensity={1.6} color="#eaf4ff" />
     </group>
   )
 }

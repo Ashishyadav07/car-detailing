@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
-import { OrbitControls, Environment, Html } from '@react-three/drei'
+import { OrbitControls, Html } from '@react-three/drei'
 import * as THREE from 'three'
 import CarModel from './CarModel'
 import CameraController from './CameraController'
@@ -272,17 +272,14 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
       <Canvas
         shadows
         camera={{ position: [4.8, 1.8, 4.8], fov: 38 }}
-        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.35 }}
+        gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.1 }}
       >
         <color attach="background" args={['#08090c']} />
 
-        {/* 1. SPACIOUS DETAILING STUDIO ENVIRONMENT (Stationary) */}
+        {/* 1. SPACIOUS DETAILING STUDIO ENVIRONMENT (Stationary) — sole environment/reflection source */}
         <StudioEnvironment />
 
-        {/* 2. STUDIO HDRI ENVIRONMENT REFLECTIONS */}
-        <Environment preset="city" environmentIntensity={1.6} />
-
-        {/* 3. CAMERA CONTROLLER FOR VIEW PRESETS */}
+        {/* 2. CAMERA CONTROLLER FOR VIEW PRESETS */}
         <CameraController cameraPresetId={cameraPresetId} controlsRef={controlsRef} />
 
         {/* 4. CENTRAL ROTATION CONTROLLER (Single State Machine driving Turntable Y-Rotation) */}
