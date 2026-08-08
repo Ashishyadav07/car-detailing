@@ -6,7 +6,7 @@ import CarModel from './CarModel'
 import CameraController from './CameraController'
 import StudioEnvironment from './StudioEnvironment'
 import { FEATURE_FOCUS_CONFIG } from '../constants/configuratorOptions'
-import { CriticallyDampedSpring, clamp, clamp01, damp, smootherstep } from '../utils/animation'
+import { CriticallyDampedSpring, clamp, clamp01, damp } from '../utils/animation'
 import { createPose, evalPose } from '../utils/heroCameraPath'
 
 /* -------------------------------------------------------------------------
@@ -26,17 +26,53 @@ const SCROLL_LEAD = 0.55
 const SCROLL_LEAD_CLAMP = 0.09
 const SCROLL_VEL_LAMBDA = 14
 
-// Turntable drag.
-const DRAG_SENSITIVITY = 0.005 // rad per pixel (unchanged)
-const DRAG_OMEGA = 20 // weight behind the finger without visible lag
-const DRAG_FRICTION = 3.2 // coast decay after release, 1/s
-const RETURN_LAMBDA = 2.6 // pull back onto the scroll-driven angle
-const RETURN_ENGAGE_VEL = 0.9 // rad/s below which the return blends in
-const SETTLE_EPS = 1e-4
+// Cinematic cursor camera orbit. The car itself is never rotated by the
+// cursor — only the camera orbits around the scroll system's own look-at
+// target. Azimuth/elevation targets are the cursor's *absolute* normalized
+// position within the hero (not accumulated deltas), so wherever the cursor
+// sits is exactly the viewpoint the camera settles at; losing the pointer
+// (leave/up/cancel) never resets these targets, so the camera holds its
+// current orbit until the cursor moves again.
+const MAX_CAMERA_AZIMUTH = (30 * Math.PI) / 180 // +/-30 deg orbit around the car
+const MAX_CAMERA_ELEVATION = (20 * Math.PI) / 180 // +/-20 deg camera rise/lower
+const CAMERA_CURSOR_OMEGA = 7 // soft, cinematic settle — slower than a UI snap
+const CURSOR_DEADZONE = 0.05 // fraction of half-width/height near center that's ignored
+
+// Manual click+drag TURNTABLE. Unlike hover, drag never touches the camera
+// at all — the camera is frozen the instant the button goes down, and
+// horizontal drag instead spins the car itself around its own vertical
+// center axis. targetCarYaw is a running total of pointer-move DELTAS
+// (never absolute cursor position, never reset), so the car can spin
+// through any number of full turns and always keeps going from wherever it
+// currently is. The spring smooths the approach so the car reads as heavy
+// rather than snapping straight to the pointer.
+const CAR_YAW_SENSITIVITY = 0.004 // rad per pixel — precise, not twitchy
+const CAR_YAW_OMEGA = 12 // a little inertia without feeling laggy
+
+// Elevation-angle backstop (angle from horizontal) — purely a degenerate-
+// case guard against the offset flipping past straight-up/straight-down. The
+// cinematic range itself comes from MAX_CAMERA_ELEVATION above.
+const MIN_CAMERA_PHI = (-80 * Math.PI) / 180
+const MAX_CAMERA_PHI = (85 * Math.PI) / 180
+
+// World-space floor clearance the orbiting camera must respect. Computed as
+// an elevation-angle floor every frame (asin, no allocation) from the
+// CURRENT scroll pose's own target height and camera radius, so it stays
+// correct across every preset instead of assuming one fixed geometry.
+const CAMERA_FLOOR_Y = 0.08
 
 // Long frames (tab wake-up, GC, a heavy React commit) would otherwise be
 // integrated as one huge step and show up as a lurch.
 const MAX_DELTA = 1 / 20
+
+// Rescales a normalized [-1, 1] axis so the innermost `dz` fraction reads as
+// exactly zero, and the remainder is rescaled back out to [-1, 1] — tiny
+// cursor jitter near the center produces no camera movement at all.
+function applyDeadzone(v, dz) {
+  if (v > dz) return (v - dz) / (1 - dz)
+  if (v < -dz) return (v + dz) / (1 - dz)
+  return 0
+}
 
 const HERO_START_POSE = evalPose(0, createPose())
 const START_CAMERA_POSITION = HERO_START_POSE.pos.toArray()
@@ -49,14 +85,22 @@ const START_CAMERA_TARGET = HERO_START_POSE.target.toArray()
 function CentralRotationController({
   config,
   rotationYRef,
+  targetCameraAzimuthRef,
+  targetCameraElevationRef,
+  cameraAzimuthSpringRef,
+  cameraElevationSpringRef,
+  targetCarYawRef,
+  carYawSpringRef,
   isDraggingRef,
-  dragTargetRef,
-  dragSpringRef,
   scrollYProgress,
   controlsRef,
   debugRefs,
 }) {
-  const pivotGroupRef = useRef()
+  // yawGroup is the car's ONE transform: rotation.y = scrollYaw + dragYaw.
+  // Nothing else ever touches the car (no position offset, no pitch/roll) —
+  // it rotates around its own vertical center axis exactly like the scroll
+  // turntable always did, drag just adds a persistent offset on top.
+  const yawGroupRef = useRef()
 
   // Every mutable piece of frame state is preallocated once.
   const scrollSpringRef = useRef(null)
@@ -70,13 +114,23 @@ function CentralRotationController({
   const debugAccumRef = useRef(0)
   const poseRef = useRef(null)
   if (poseRef.current === null) poseRef.current = createPose()
+  // Reused every frame for the cursor camera orbit — never reallocated.
+  const orbitOffsetRef = useRef(null)
+  if (orbitOffsetRef.current === null) orbitOffsetRef.current = new THREE.Vector3()
+  // Camera pose frozen at the instant a drag starts — reused every frame
+  // while dragging so the camera is bit-for-bit static, tripod-mounted.
+  const frozenCameraPosRef = useRef(null)
+  if (frozenCameraPosRef.current === null) frozenCameraPosRef.current = new THREE.Vector3()
+  const frozenCameraTargetRef = useRef(null)
+  if (frozenCameraTargetRef.current === null) frozenCameraTargetRef.current = new THREE.Vector3()
+  const wasDraggingRef = useRef(false)
 
   // Priority -2 so this runs *before* drei's OrbitControls update (which is
   // registered at -1). The controls then apply our pose once per frame instead
   // of the scene being updated twice.
   useFrame((state, delta) => {
-    const pivot = pivotGroupRef.current
-    if (!pivot) return
+    const yawGroup = yawGroupRef.current
+    if (!yawGroup) return
 
     const dt = delta > MAX_DELTA ? MAX_DELTA : delta
     if (dt <= 0) return
@@ -102,46 +156,76 @@ function CentralRotationController({
 
     const pose = evalPose(p, poseRef.current)
 
-    /* --- 3. Turntable = scroll angle + drag offset ----------------------- */
+    /* --- 3. Turntable = scroll angle + persistent drag yaw ----------------
+     * finalYaw = scrollYaw + userDragYaw. Scroll keeps driving its own
+     * turntable exactly as before; drag adds an independent, persistent
+     * offset that scroll never resets and drag never fights. */
 
-    const drag = dragSpringRef.current
-    if (isDraggingRef.current) {
-      // The offset springs toward the raw pointer target: the car has weight
-      // behind the finger and single-pixel pointer jitter is filtered out.
-      drag.step(dragTargetRef.current, DRAG_OMEGA, dt)
-    } else {
-      // Release keeps the spring's own velocity, so there is no discontinuity
-      // at the moment the pointer lifts. Momentum coasts under friction and
-      // the pull back onto the scroll angle fades in as that momentum dies,
-      // which removes the hard state switch the old machine had.
-      drag.velocity *= Math.exp(-DRAG_FRICTION * dt)
-      drag.value += drag.velocity * dt
+    const carYawSpring = carYawSpringRef.current
+    carYawSpring.step(targetCarYawRef.current, CAR_YAW_OMEGA, dt)
 
-      const engage = smootherstep(
-        1 - clamp01(Math.abs(drag.velocity) / RETURN_ENGAGE_VEL)
-      )
-      if (engage > 0) {
-        drag.value = damp(drag.value, 0, RETURN_LAMBDA * engage, dt)
-      }
+    rotationYRef.current = pose.rotY + carYawSpring.value
+    yawGroup.rotation.y = rotationYRef.current
 
-      if (Math.abs(drag.velocity) < SETTLE_EPS && Math.abs(drag.value) < SETTLE_EPS) {
-        drag.velocity = 0
-        drag.value = 0
-      }
-      dragTargetRef.current = drag.value
-    }
+    /* --- 4. Camera ---------------------------------------------------------
+     * MODE 1 (hover, no button held): unchanged cinematic behavior — cursor
+     * position drives an azimuth/elevation OFFSET on top of the scroll
+     * camera pose via a critically-damped spring that never resets.
+     * MODE 2 (drag): the camera is a locked-off tripod. The pose captured
+     * on the very first dragging frame is reasserted, verbatim, every
+     * frame — hover's springs are left completely untouched (frozen in
+     * place) so there is no jump the instant the button is released and
+     * hover resumes from exactly where it left off. */
 
-    rotationYRef.current = pose.rotY + drag.value
-    pivot.rotation.y = rotationYRef.current
-
-    /* --- 4. Camera ------------------------------------------------------- */
-
-    state.camera.position.copy(pose.pos)
     const controls = controlsRef.current
-    if (controls) {
-      controls.target.copy(pose.target)
+
+    if (isDraggingRef.current) {
+      if (!wasDraggingRef.current) {
+        // First frame of this drag: freeze whatever hover left on screen.
+        frozenCameraPosRef.current.copy(state.camera.position)
+        frozenCameraTargetRef.current.copy(controls ? controls.target : pose.target)
+        wasDraggingRef.current = true
+      }
+      state.camera.position.copy(frozenCameraPosRef.current)
+      if (controls) {
+        controls.target.copy(frozenCameraTargetRef.current)
+      } else {
+        state.camera.lookAt(frozenCameraTargetRef.current)
+      }
     } else {
-      state.camera.lookAt(pose.target)
+      wasDraggingRef.current = false
+
+      const azimuthSpring = cameraAzimuthSpringRef.current
+      azimuthSpring.step(targetCameraAzimuthRef.current, CAMERA_CURSOR_OMEGA, dt)
+
+      const elevationSpring = cameraElevationSpringRef.current
+      elevationSpring.step(targetCameraElevationRef.current, CAMERA_CURSOR_OMEGA, dt)
+
+      const offset = orbitOffsetRef.current
+      offset.copy(pose.pos).sub(pose.target)
+      const radius = offset.length()
+      if (radius > 1e-4) {
+        const theta = Math.atan2(offset.x, offset.z) + azimuthSpring.value
+        // Floor safety, solved fresh each frame for the current pose's own
+        // target height and camera radius: the lowest phi that still keeps
+        // camera.y >= CAMERA_FLOOR_Y. Whichever floor is higher — this or
+        // the fixed backstop — wins.
+        const floorPhi = Math.asin(clamp((CAMERA_FLOOR_Y - pose.target.y) / radius, -1, 1))
+        const phi = clamp(
+          Math.asin(clamp(offset.y / radius, -1, 1)) + elevationSpring.value,
+          Math.max(MIN_CAMERA_PHI, floorPhi),
+          MAX_CAMERA_PHI
+        )
+        const horizontalR = radius * Math.cos(phi)
+        offset.set(horizontalR * Math.sin(theta), radius * Math.sin(phi), horizontalR * Math.cos(theta))
+      }
+
+      state.camera.position.copy(pose.target).add(offset)
+      if (controls) {
+        controls.target.copy(pose.target)
+      } else {
+        state.camera.lookAt(pose.target)
+      }
     }
 
     /* --- 5. Debug HUD, written straight to the DOM at 10Hz --------------- */
@@ -152,9 +236,11 @@ function CentralRotationController({
     if (debugAccumRef.current >= 0.1) {
       debugAccumRef.current = 0
       const stateName = isDraggingRef.current
-        ? 'DRAGGING'
-        : drag.velocity !== 0 || drag.value !== 0
-          ? 'MOMENTUM'
+        ? 'CAR ROTATE (camera locked)'
+        : carYawSpring.value !== 0 ||
+            targetCameraAzimuthRef.current !== 0 ||
+            targetCameraElevationRef.current !== 0
+          ? 'CAMERA ORBIT'
           : 'SCROLLING'
       writeDebug(debugRefs.progress.current, clamp01(p).toFixed(2))
       writeDebug(debugRefs.state.current, stateName)
@@ -163,7 +249,7 @@ function CentralRotationController({
   }, -2)
 
   return (
-    <group ref={pivotGroupRef} position={[0, 0, 0]}>
+    <group ref={yawGroupRef}>
       <CarModel url="/models/ford_mustang_shelby_gt500.glb" config={config} />
     </group>
   )
@@ -188,14 +274,36 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
   const controlsRef = useRef()
   const rotationYRef = useRef(FEATURE_FOCUS_CONFIG.hero34)
 
-  // Drag state. Shared by reference with the frame loop so pointer events
-  // never trigger a React render.
-  const isDraggingRef = useRef(false)
-  const dragTargetRef = useRef(0)
-  const dragSpringRef = useRef(null)
-  if (dragSpringRef.current === null) dragSpringRef.current = new CriticallyDampedSpring(0)
-  const lastPointerXRef = useRef(0)
+  // Persistent cursor CAMERA orbit state — this never touches the car.
+  // targetCameraAzimuthRef/targetCameraElevationRef hold the cursor's
+  // current (deadzoned) normalized position, shared by reference with the
+  // frame loop so pointer movement never triggers a React render.
+  const targetCameraAzimuthRef = useRef(0)
+  const targetCameraElevationRef = useRef(0)
+  const cameraAzimuthSpringRef = useRef(null)
+  if (cameraAzimuthSpringRef.current === null)
+    cameraAzimuthSpringRef.current = new CriticallyDampedSpring(0)
+  const cameraElevationSpringRef = useRef(null)
+  if (cameraElevationSpringRef.current === null)
+    cameraElevationSpringRef.current = new CriticallyDampedSpring(0)
+
+  // Hero bounding rect, cached on pointer-enter so pointermove never forces
+  // a synchronous layout read.
+  const rectRef = useRef(null)
   const activePointerRef = useRef(null)
+  const hasInteractedRef = useRef(false)
+
+  // Manual click+drag CAR TURNTABLE state. isDraggingRef gates
+  // handlePointerMove between the two modes (and tells the frame loop to
+  // freeze the camera). targetCarYawRef is a running total of pointer-move
+  // DELTAS — never absolute cursor position, never reset by scroll, hover,
+  // or pointer-leave/up/cancel — so the car keeps spinning from wherever it
+  // currently is, through any number of full turns.
+  const isDraggingRef = useRef(false)
+  const lastDragClientXRef = useRef(0)
+  const targetCarYawRef = useRef(0)
+  const carYawSpringRef = useRef(null)
+  if (carYawSpringRef.current === null) carYawSpringRef.current = new CriticallyDampedSpring(0)
 
   const debugRefs = useRef({
     progress: React.createRef(),
@@ -220,55 +328,103 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
     return () => observer.disconnect()
   }, [])
 
-  const handlePointerDown = useCallback(
+  // Cursor control is hover-driven when no button is held, not click-drag: a
+  // mouse only ever emits pointermove while it is over the canvas (no button
+  // needed), while touch only emits it while a finger is in contact, so the
+  // same handler gives mice free hover-orbit and touch a drag-orbit for
+  // free. Pressing the button switches the SAME pointermove stream into
+  // manual drag mode (see handlePointerDown/handlePointerMove below).
+  const captureBaseline = useCallback((e) => {
+    activePointerRef.current = e.pointerId
+    if (rootRef.current) rectRef.current = rootRef.current.getBoundingClientRect()
+  }, [])
+
+  // Only the primary button/touch starts a drag; a stray right-click drag,
+  // for example, should not hijack the car. No camera/target capture is
+  // needed here — the frame loop freezes whatever's currently on screen the
+  // moment it next sees isDraggingRef true (see CentralRotationController).
+  const handlePointerDown = useCallback((e) => {
+    if (e.button !== 0) return
+    activePointerRef.current = e.pointerId
+    isDraggingRef.current = true
+    lastDragClientXRef.current = e.clientX
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }, [])
+
+  const handlePointerMove = useCallback(
     (e) => {
-      if (e.button !== undefined && e.button !== 0) return
-      isDraggingRef.current = true
-      activePointerRef.current = e.pointerId
-      lastPointerXRef.current = e.clientX
-      // Catch the car exactly where it is; the spring bleeds off any leftover
-      // momentum instead of the rotation jumping.
-      dragTargetRef.current = dragSpringRef.current.value
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId)
-      } catch {
-        /* capture is best-effort */
+      if (activePointerRef.current === null) activePointerRef.current = e.pointerId
+      if (e.pointerId !== activePointerRef.current) return
+
+      if (isDraggingRef.current) {
+        // Manual drag takes priority over hover and spins the CAR, not the
+        // camera. Frame-to-frame DELTA (not absolute position, not
+        // distance-from-pointerdown) accumulates into a running total that
+        // is never clamped or normalized — the car can spin through any
+        // number of full turns and always continues from wherever it is.
+        const dx = e.clientX - lastDragClientXRef.current
+        lastDragClientXRef.current = e.clientX
+        targetCarYawRef.current += dx * CAR_YAW_SENSITIVITY
+      } else {
+        const rect = rectRef.current
+        if (!rect || rect.width === 0 || rect.height === 0) return
+
+        // Normalize to the hero bounds: X in [-1 left, +1 right],
+        // Y in [-1 bottom, +1 top] (screen Y grows downward, so it's flipped).
+        const nx = clamp(((e.clientX - rect.left) / rect.width) * 2 - 1, -1, 1)
+        const ny = clamp(-(((e.clientY - rect.top) / rect.height) * 2 - 1), -1, 1)
+
+        // These are the cursor's ABSOLUTE position mapped straight to a
+        // camera orbit target — not an accumulated delta — so the camera
+        // orbit always matches where the cursor currently sits, and holds
+        // there unchanged the instant the cursor stops moving. Completely
+        // untouched by drag: the car and camera are separate axes now, so
+        // there's nothing to reconcile on the mode transition.
+        targetCameraAzimuthRef.current = applyDeadzone(nx, CURSOR_DEADZONE) * MAX_CAMERA_AZIMUTH
+        targetCameraElevationRef.current = applyDeadzone(ny, CURSOR_DEADZONE) * MAX_CAMERA_ELEVATION
       }
-      if (onUserInteract) onUserInteract()
+
+      if (!hasInteractedRef.current) {
+        hasInteractedRef.current = true
+        if (onUserInteract) onUserInteract()
+      }
     },
     [onUserInteract]
   )
 
-  const handlePointerMove = useCallback((e) => {
-    if (!isDraggingRef.current) return
-    if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return
-    const x = e.clientX
-    dragTargetRef.current += (x - lastPointerXRef.current) * DRAG_SENSITIVITY
-    lastPointerXRef.current = x
-  }, [])
-
-  // Pointer capture guarantees this fires even when the release happens
-  // outside the canvas, which previously left the controller stuck in
-  // DRAGGING and froze the scroll animation.
-  const handlePointerUp = useCallback((e) => {
-    if (!isDraggingRef.current) return
+  // Ends a drag (pointerup/pointercancel). targetCarYawRef is deliberately
+  // left untouched — the car simply stays at whatever rotation the drag
+  // reached, and hover resumes computing its own independent camera target
+  // exactly as it always has (hover was never touched by the drag, so
+  // there's no baseline to reconcile here).
+  const endDrag = useCallback((e) => {
     if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return
     isDraggingRef.current = false
+    activePointerRef.current = null
+  }, [])
+
+  // Plain hover leaving the canvas: pointer capture keeps a drag's
+  // move/up events routed to us regardless of where the cursor physically
+  // is, so this only ever fires for the non-drag hover case.
+  const handlePointerLeave = useCallback((e) => {
+    if (isDraggingRef.current) return
+    if (activePointerRef.current !== null && e.pointerId !== activePointerRef.current) return
     activePointerRef.current = null
   }, [])
 
   return (
     <div
       ref={rootRef}
-      className="w-full h-full bg-[#08090c] overflow-hidden select-none cursor-grab active:cursor-grabbing relative"
+      className="w-full h-full bg-[#08090c] overflow-hidden select-none relative"
       // pan-y keeps vertical page scrolling native on touch while horizontal
       // gestures reach us as pointer events without being cancelled.
       style={{ touchAction: 'pan-y' }}
+      onPointerEnter={captureBaseline}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerUp}
-      onLostPointerCapture={handlePointerUp}
+      onPointerLeave={handlePointerLeave}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
     >
       <Canvas
         shadows
@@ -289,14 +445,18 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
         {/* 2. CAMERA CONTROLLER FOR VIEW PRESETS */}
         <CameraController cameraPresetId={cameraPresetId} controlsRef={controlsRef} />
 
-        {/* 4. CENTRAL ROTATION CONTROLLER (Single State Machine driving Turntable Y-Rotation) */}
+        {/* 4. CENTRAL ROTATION CONTROLLER (scroll+drag car turntable, cinematic hover camera / locked drag camera) */}
         <React.Suspense fallback={<Loader />}>
           <CentralRotationController
             config={config}
             rotationYRef={rotationYRef}
+            targetCameraAzimuthRef={targetCameraAzimuthRef}
+            targetCameraElevationRef={targetCameraElevationRef}
+            cameraAzimuthSpringRef={cameraAzimuthSpringRef}
+            cameraElevationSpringRef={cameraElevationSpringRef}
+            targetCarYawRef={targetCarYawRef}
+            carYawSpringRef={carYawSpringRef}
             isDraggingRef={isDraggingRef}
-            dragTargetRef={dragTargetRef}
-            dragSpringRef={dragSpringRef}
             scrollYProgress={scrollYProgress}
             controlsRef={controlsRef}
             debugRefs={debugRefs}
@@ -306,12 +466,17 @@ export default function CarViewer({ config, cameraPresetId, onUserInteract, scro
         {/* 5. ORBIT CONTROLS FOR MOUSE/TOUCH PANNING (Wheel Zoom Disabled to Allow Natural Page Scroll) */}
         <OrbitControls
           ref={controlsRef}
-          enableRotate={false} // Horizontal drag directly drives central rotation controller
+          enableRotate={false} // Camera pose is driven entirely by the controller above
           enablePan={false}
           enableZoom={false} // CRITICAL FIX: Disable wheel zoom so mouse wheel triggers page scrolling!
           enableDamping={false} // All damping is handled by the controller above
-          minPolarAngle={Math.PI / 4} // 45 deg elevation
-          maxPolarAngle={Math.PI / 2 - 0.02} // Prevents camera going below floor
+          // Kept deliberately permissive: the controller above is the sole
+          // authority on elevation range (MIN_CAMERA_PHI/MAX_CAMERA_PHI plus
+          // the dynamic floor clamp for both hover and manual drag). These
+          // are just a last-resort guard against the polar angle reaching
+          // the degenerate poles.
+          minPolarAngle={0.05}
+          maxPolarAngle={Math.PI - 0.05}
           target={START_CAMERA_TARGET}
           makeDefault
         />

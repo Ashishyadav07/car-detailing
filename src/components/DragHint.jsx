@@ -15,7 +15,7 @@ export default function DragHint({ visible }) {
         >
           <div className="flex items-center gap-2 bg-slate-900/60 text-slate-300 px-4 py-1.5 rounded-full border-[0.5px] border-slate-700/40 backdrop-blur-md text-[11px] font-mono tracking-widest uppercase shadow-lg">
             <MoveHorizontal className="w-3.5 h-3.5 text-blue-400 animate-pulse" />
-            <span>Drag to Explore 360°</span>
+            <span>Move Cursor to Explore 360°</span>
           </div>
         </motion.div>
       )}

@@ -53,7 +53,7 @@ const DULL_CLEARCOAT_ROUGHNESS = 0.6
 const DULL_ENV_INTENSITY = 0.5
 const GLOSSY_ENV_INTENSITY = 1.9
 
-export default function CarModel({ url, config, finishRef = null }) {
+export default function CarModel({ url, config, finishRef = null, onBoundsReady = null }) {
   const { scene } = useGLTF(url)
   const clonedScene = useMemo(() => scene.clone(true), [scene])
   const groupRef = useRef()
@@ -126,6 +126,17 @@ export default function CarModel({ url, config, finishRef = null }) {
     clonedScene.position.x = -center.x
     clonedScene.position.z = -center.z
     clonedScene.position.y = -box.min.y
+
+    // Bounds in this group's own frame, now that the offsets above pin the
+    // bottom at y=0 and the footprint at x=0/z=0: height and half-depth are
+    // exactly what a caller needs to reason about vertical tilt without ever
+    // re-running Box3 on the live (possibly rotated) scene.
+    if (onBoundsReady) {
+      onBoundsReady({
+        height: box.max.y - box.min.y,
+        halfDepth: (box.max.z - box.min.z) / 2,
+      })
+    }
 
     // Reset categorization refs
     materialsRef.current = { paint: [], rim: [], tire: [], brake: [], interior: [], glass: [] }
